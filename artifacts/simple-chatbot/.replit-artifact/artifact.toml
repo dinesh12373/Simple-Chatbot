@@ -1,0 +1,24 @@
+kind = "mobile"
+previewPath = "/"
+title = "Simple Chatbot"
+description = "A simple native mobile chatbot for quick conversations, with a focused chat screen, sendable messages, and an initial self-contained reply flow."
+version = "1.0.0"
+id = "artifacts/simple-chatbot"
+router = "expo-domain"
+
+[[services]]
+name = "expo"
+ensurePreviewReachable = "/status"
+paths = [ "/" ]
+localPort = 21061
+
+[services.development]
+run = "pnpm --filter @workspace/simple-chatbot run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/simple-chatbot", "run", "build" ]
+run = [ "pnpm", "--filter", "@workspace/simple-chatbot", "run", "serve" ]
+
+[services.env]
+PORT = "21061"
+BASE_PATH = "/"
