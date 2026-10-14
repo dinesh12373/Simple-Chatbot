@@ -142,6 +142,10 @@ async function startMetro(expoPublicDomain, expoPublicReplId) {
     ...process.env,
     EXPO_PUBLIC_DOMAIN: expoPublicDomain,
     EXPO_PUBLIC_REPL_ID: expoPublicReplId,
+    EXPO_PUBLIC_SUPABASE_URL:
+      process.env.project_url || process.env.EXPO_PUBLIC_SUPABASE_URL,
+    EXPO_PUBLIC_SUPABASE_ANON_KEY:
+      process.env.anon_key || process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY,
   };
 
   if (expoPublicReplId) {

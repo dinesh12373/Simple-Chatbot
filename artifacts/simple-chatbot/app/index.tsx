@@ -16,6 +16,7 @@ import {
 import { KeyboardAvoidingView } from 'react-native-keyboard-controller';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useColors } from '@/hooks/useColors';
+import { supabase, supabaseConfigured } from '@/lib/supabase';
 
 type Message = {
   id: string;
@@ -24,12 +25,13 @@ type Message = {
   createdAt: number;
 };
 
-const STORAGE_KEY = '@sprout-chat/messages';
 const QUICK_PROMPTS = [
   'Give me a dinner idea',
   'Help me plan my day',
   'Tell me a joke',
 ];
+const LEGACY_STORAGE_KEY = '@sprout-chat/messages';
+const LEGACY_MIGRATED_KEY = '@sprout-chat/supabase-migration-complete';
 
 let messageCounter = 0;
 
@@ -52,31 +54,35 @@ function getWelcomeMessages(): Message[] {
   ];
 }
 
-function parseMessages(raw: string | null): Message[] | null {
+function parseLegacyMessages(raw: string | null): Message[] | null {
   if (!raw) {
     return null;
   }
 
-  const parsed: unknown = JSON.parse(raw);
-  if (!Array.isArray(parsed)) {
-    return null;
-  }
-
-  const validMessages = parsed.filter((item): item is Message => {
-    if (!item || typeof item !== 'object') {
-      return false;
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) {
+      return null;
     }
 
-    const candidate = item as Record<string, unknown>;
-    return (
-      typeof candidate.id === 'string' &&
-      (candidate.role === 'assistant' || candidate.role === 'user') &&
-      typeof candidate.text === 'string' &&
-      typeof candidate.createdAt === 'number'
-    );
-  });
+    const validMessages = parsed.filter((item): item is Message => {
+      if (!item || typeof item !== 'object') {
+        return false;
+      }
 
-  return validMessages.length > 0 ? validMessages : null;
+      const candidate = item as Record<string, unknown>;
+      return (
+        typeof candidate.id === 'string' &&
+        (candidate.role === 'assistant' || candidate.role === 'user') &&
+        typeof candidate.text === 'string' &&
+        typeof candidate.createdAt === 'number'
+      );
+    });
+
+    return validMessages.length > 0 ? validMessages : null;
+  } catch {
+    return null;
+  }
 }
 
 function getBotReply(message: string): string {
@@ -111,6 +117,29 @@ function getBotReply(message: string): string {
   }
 
   return 'I’m a small offline chatbot, so I don’t know everything yet. Try asking for a quick meal idea, a simple plan for your day, or a light joke. You can also ask “help.”';
+}
+
+function getConnectionErrorMessage(error: unknown): string {
+  const details =
+    error && typeof error === 'object'
+      ? (error as { code?: unknown; message?: unknown })
+      : {};
+  const code = typeof details.code === 'string' ? details.code : '';
+  const message =
+    typeof details.message === 'string' ? details.message.toLowerCase() : '';
+
+  if (
+    code === 'anonymous_provider_disabled' ||
+    (message.includes('anonymous') && message.includes('disabled'))
+  ) {
+    return 'Enable Anonymous Sign-Ins in Supabase Authentication, then retry.';
+  }
+
+  if (code === 'PGRST205' || message.includes('chat_messages')) {
+    return 'Run supabase/schema.sql in the Supabase SQL Editor, then retry.';
+  }
+
+  return 'Could not load chat history. Check Supabase setup and connection, then retry.';
 }
 
 type MessageBubbleProps = {
@@ -186,91 +215,198 @@ export default function ChatScreen() {
   const [draft, setDraft] = useState('');
   const [isReady, setIsReady] = useState(false);
   const [isThinking, setIsThinking] = useState(false);
-  const [storageWarning, setStorageWarning] = useState('');
+  const [userId, setUserId] = useState<string | null>(null);
+  const [connectionError, setConnectionError] = useState('');
   const reversedMessages = useMemo(() => [...messages].reverse(), [messages]);
   const hasUserMessage = messages.some((message) => message.role === 'user');
   const webTopInset = Platform.OS === 'web' ? Math.max(insets.top, 67) : insets.top;
   const composerBottomInset =
     Platform.OS === 'web' ? Math.max(insets.bottom, 34) : Math.max(insets.bottom, 12);
 
-  useEffect(() => {
-    let isMounted = true;
+  async function connectAndLoad() {
+    setIsReady(false);
+    setUserId(null);
+    setConnectionError('');
 
-    async function loadConversation() {
-      try {
-        const savedMessages = parseMessages(await AsyncStorage.getItem(STORAGE_KEY));
-        if (isMounted && savedMessages) {
-          setMessages(savedMessages);
-        }
-      } catch {
-        if (isMounted) {
-          setStorageWarning('Saved chat history could not be restored.');
-        }
-      } finally {
-        if (isMounted) {
-          setIsReady(true);
-        }
-      }
-    }
-
-    void loadConversation();
-    return () => {
-      isMounted = false;
-    };
-  }, []);
-
-  useEffect(() => {
-    if (!isReady) {
+    if (!supabaseConfigured || !supabase) {
+      setConnectionError(
+        'Supabase is not configured. Check the project URL and anon key secrets.',
+      );
       return;
     }
 
-    void AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(messages)).catch(() => {
-      setStorageWarning('Chat history could not be saved on this device.');
-    });
-  }, [isReady, messages]);
+    try {
+      const {
+        data: { session },
+        error: sessionError,
+      } = await supabase.auth.getSession();
+      if (sessionError) {
+        throw sessionError;
+      }
+
+      let activeSession = session;
+      if (!activeSession) {
+        const { data, error } = await supabase.auth.signInAnonymously();
+        if (error) {
+          throw error;
+        }
+        activeSession = data.session;
+      }
+
+      if (!activeSession) {
+        throw new Error('Supabase did not create an anonymous session.');
+      }
+
+      const activeUserId = activeSession.user.id;
+      const { data, error } = await supabase
+        .from('chat_messages')
+        .select('id, user_id, role, content, created_at')
+        .eq('user_id', activeUserId)
+        .order('created_at', { ascending: true });
+
+      if (error) {
+        throw error;
+      }
+
+      let restoredMessages: Message[] | null = data.map((row) => ({
+        id: row.id,
+        role: row.role,
+        text: row.content,
+        createdAt: Date.parse(row.created_at),
+      }));
+
+      if (restoredMessages.length > 0) {
+        await AsyncStorage.setItem(LEGACY_MIGRATED_KEY, 'true');
+        await AsyncStorage.removeItem(LEGACY_STORAGE_KEY);
+      } else if (
+        (await AsyncStorage.getItem(LEGACY_MIGRATED_KEY)) !== 'true'
+      ) {
+        const localMessages = parseLegacyMessages(
+          await AsyncStorage.getItem(LEGACY_STORAGE_KEY),
+        );
+
+        if (localMessages) {
+          const { error: migrationError } = await supabase
+            .from('chat_messages')
+            .insert(
+              localMessages.map((message) => ({
+                id: message.id,
+                user_id: activeUserId,
+                role: message.role,
+                content: message.text,
+                created_at: new Date(message.createdAt).toISOString(),
+              })),
+            );
+
+          if (migrationError) {
+            throw migrationError;
+          }
+
+          restoredMessages = localMessages;
+        }
+
+        await AsyncStorage.setItem(LEGACY_MIGRATED_KEY, 'true');
+        await AsyncStorage.removeItem(LEGACY_STORAGE_KEY);
+      }
+
+      setUserId(activeUserId);
+      setMessages(
+        restoredMessages.length > 0 ? restoredMessages : getWelcomeMessages(),
+      );
+      setIsReady(true);
+    } catch (error) {
+      setConnectionError(getConnectionErrorMessage(error));
+    }
+  }
+
+  useEffect(() => {
+    void connectAndLoad();
+  }, []);
 
   async function sendMessage(rawText: string) {
     const text = rawText.trim();
-    if (!text || !isReady || isThinking) {
+    const activeSupabase = supabase;
+    const activeUserId = userId;
+    if (!text || !isReady || isThinking || !activeSupabase || !activeUserId) {
       return;
     }
 
     setDraft('');
     setIsThinking(true);
-    setStorageWarning('');
-    setMessages((current) => [...current, createMessage('user', text)]);
+    setConnectionError('');
+    const userMessage = createMessage('user', text);
+    setMessages((current) => [...current, userMessage]);
     void Haptics.selectionAsync().catch(() => undefined);
 
-    await new Promise((resolve) => setTimeout(resolve, 450));
-    setMessages((current) => [
-      ...current,
-      createMessage('assistant', getBotReply(text)),
-    ]);
-    setIsThinking(false);
-    void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(
-      () => undefined,
-    );
-    requestAnimationFrame(() => inputRef.current?.focus());
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 350));
+      const assistantMessage = createMessage('assistant', getBotReply(text));
+      const { error } = await activeSupabase.from('chat_messages').insert([
+        {
+          id: userMessage.id,
+          user_id: activeUserId,
+          role: userMessage.role,
+          content: userMessage.text,
+          created_at: new Date(userMessage.createdAt).toISOString(),
+        },
+        {
+          id: assistantMessage.id,
+          user_id: activeUserId,
+          role: assistantMessage.role,
+          content: assistantMessage.text,
+          created_at: new Date(assistantMessage.createdAt).toISOString(),
+        },
+      ]);
+
+      if (error) {
+        throw error;
+      }
+
+      setMessages((current) => [...current, assistantMessage]);
+      void Haptics.notificationAsync(
+        Haptics.NotificationFeedbackType.Success,
+      ).catch(() => undefined);
+    } catch {
+      setMessages((current) =>
+        current.filter((message) => message.id !== userMessage.id),
+      );
+      setDraft(text);
+      setConnectionError('Message could not be saved. Check your connection and try again.');
+    } finally {
+      setIsThinking(false);
+      requestAnimationFrame(() => inputRef.current?.focus());
+    }
   }
 
   function clearConversation() {
+    const activeSupabase = supabase;
+    const activeUserId = userId;
+    if (!isReady || !activeSupabase || !activeUserId) {
+      return;
+    }
+
     Alert.alert(
       'Clear this chat?',
-      'This removes the saved conversation from this device.',
+      'This permanently removes your saved chat history from Supabase.',
       [
         { text: 'Keep chat', style: 'cancel' },
         {
           text: 'Clear',
           style: 'destructive',
-          onPress: () => {
-            setMessages([
-              createMessage(
-                'assistant',
-                'This conversation is cleared. I’m here whenever you want to start again.',
-              ),
-            ]);
-            setStorageWarning('');
-          },
+          onPress: () => void (async () => {
+            const { error } = await activeSupabase
+              .from('chat_messages')
+              .delete()
+              .eq('user_id', activeUserId);
+
+            if (error) {
+              setConnectionError('Could not clear chat history. Please try again.');
+              return;
+            }
+
+            setMessages(getWelcomeMessages());
+            setConnectionError('');
+          })(),
         },
       ],
     );
@@ -303,18 +439,34 @@ export default function ChatScreen() {
               Sprout
             </Text>
             <View style={styles.statusLine}>
-              <View style={[styles.statusDot, { backgroundColor: colors.primary }]} />
+              <View
+                style={[
+                  styles.statusDot,
+                  {
+                    backgroundColor: isReady
+                      ? colors.primary
+                      : connectionError
+                        ? colors.destructive
+                        : colors.mutedForeground,
+                  },
+                ]}
+              />
               <Text style={[styles.statusText, { color: colors.mutedForeground }]}>
-                offline and ready
+                {isReady
+                  ? 'offline replies · synced'
+                  : connectionError
+                    ? 'history unavailable'
+                    : 'syncing history'}
               </Text>
             </View>
           </View>
         </View>
         <Pressable
           accessibilityRole="button"
-          accessibilityLabel="Clear conversation"
+          accessibilityLabel="Clear cloud chat history"
           testID="clear-chat-button"
           hitSlop={12}
+          disabled={!isReady || isThinking}
           onPress={clearConversation}
           style={({ pressed }) => [styles.headerAction, pressed && styles.pressed]}
         >
@@ -376,10 +528,28 @@ export default function ChatScreen() {
           </View>
         )}
 
-        {!!storageWarning && (
-          <Text style={[styles.storageWarning, { color: colors.destructive }]}>
-            {storageWarning}
-          </Text>
+        {!!connectionError && (
+          <View
+            style={[
+              styles.connectionNotice,
+              { backgroundColor: colors.secondary },
+            ]}
+          >
+            <Text style={[styles.connectionErrorText, { color: colors.destructive }]}>
+              {connectionError}
+            </Text>
+            <Pressable
+              accessibilityRole="button"
+              testID="retry-supabase-button"
+              disabled={isThinking}
+              onPress={() => void connectAndLoad()}
+              style={({ pressed }) => pressed && styles.pressed}
+            >
+              <Text style={[styles.retryText, { color: colors.accentForeground }]}>
+                Retry
+              </Text>
+            </Pressable>
+          </View>
         )}
 
         <View
@@ -435,7 +605,9 @@ export default function ChatScreen() {
           </Pressable>
         </View>
         <Text style={[styles.privacyNote, { color: colors.mutedForeground }]}>
-          Your conversation stays on this device.
+          {isReady
+            ? 'History syncs to this install’s private Supabase session.'
+            : 'Finish Supabase setup to sync chat history.'}
         </Text>
       </View>
     </KeyboardAvoidingView>
@@ -595,10 +767,23 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontFamily: 'Inter_500Medium',
   },
-  storageWarning: {
+  connectionNotice: {
+    borderRadius: 13,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+  },
+  connectionErrorText: {
+    flex: 1,
     fontSize: 12,
     fontFamily: 'Inter_500Medium',
-    paddingHorizontal: 3,
+    lineHeight: 17,
+  },
+  retryText: {
+    fontSize: 12,
+    fontFamily: 'Inter_600SemiBold',
   },
   composer: {
     minHeight: 54,
